@@ -5,4 +5,4 @@ stats_log.jsonl
 Thumbs.db
 .idea/
 tests/_test_stats.jsonl
-内部交接文档（已移除）
+docs/交接文档.md
