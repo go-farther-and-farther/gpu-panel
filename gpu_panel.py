@@ -765,20 +765,20 @@ tbody tr:hover{background:rgba(255,255,255,.02)}
 <div id="banner" class="banner hidden"></div>
 
 <section class="grid">
-  <div class="card" style="--c:var(--gpu)">
+  <div class="card" id="card_gpu_util" style="--c:var(--gpu)">
     <div class="label">GPU 利用率</div>
     <div class="value" id="gpu_util">—</div>
     <div class="bar"><i id="gpu_util_bar"></i></div>
     <canvas class="spark" id="sp_util"></canvas>
   </div>
-  <div class="card" style="--c:var(--gpu)">
+  <div class="card" id="card_gpu_mem" style="--c:var(--gpu)">
     <div class="label">显存</div>
     <div class="value" id="gpu_mem">—</div>
     <div class="extra" id="gpu_mem_extra"></div>
     <div class="bar"><i id="gpu_mem_bar"></i></div>
     <canvas class="spark" id="sp_vram"></canvas>
   </div>
-  <div class="card" style="--c:var(--temp)">
+  <div class="card" id="card_gpu_temp" style="--c:var(--temp)">
     <div class="label">GPU 温度 / 功耗</div>
     <div class="value" id="gpu_temp">—</div>
     <div class="extra" id="gpu_extra"></div>
@@ -1086,7 +1086,13 @@ function render(s){
   var gpus = (gpu.gpus && gpu.gpus.length) ? gpu.gpus : [];
   var g0 = gpus[0] || {};
 
-  $("gname").textContent = g0.name || "NVIDIA GPU";
+  // 优雅降级：没采到任何 GPU（未装 NVIDIA 卡 / nvidia-smi 失败）时隐藏 GPU 卡片，
+  // 剩下内存 / CPU / 磁盘照常显示
+  var noGpu = !gpus.length;
+  ["card_gpu_util", "card_gpu_mem", "card_gpu_temp"].forEach(function(id){
+    $(id).classList.toggle("hidden", noGpu);
+  });
+  $("gname").textContent = g0.name || (noGpu ? "未检测到 NVIDIA GPU" : "NVIDIA GPU");
 
   // GPU 利用率
   var util = g0.util;
