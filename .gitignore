@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+stats_log.jsonl
+*.csv
+Thumbs.db
