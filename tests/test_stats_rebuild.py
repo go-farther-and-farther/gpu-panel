@@ -17,7 +17,7 @@ src = src.replace("if sys.stdout is None:", "if False:")
 
 ns = {"__name__": "gpu_panel_test",
       "__file__": SRC,
-      "SCRIPT_DIR": r"<local-path>"}
+      "SCRIPT_DIR": "."}  # 会被被测模块用 __file__ 重新赋值，这里仅占位
 exec(compile(src, SRC, "exec"), ns)
 
 # ---- 构造 3 天模拟数据 ----
