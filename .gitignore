@@ -3,3 +3,5 @@ __pycache__/
 stats_log.jsonl
 *.csv
 Thumbs.db
+.idea/
+tests/_test_stats.jsonl
