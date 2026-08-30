@@ -90,13 +90,6 @@ _history_lock = threading.Lock()
 _csv_init = {"done": False}
 _last_csv_t = {"t": 0.0}
 
-# llama.cpp 速率计算：
-#   _llama_prev[sid]  = 上一次采样的 (n_decoded, n_prompt_processed, task_id, t)
-#   _llama_track[sid] = 当前任务 {task, t0, d0, samples:[(t, n_decoded)...]}
-_llama_prev = {}
-_llama_track = {}
-_sess_decoded = [0]  # 面板启动以来观察到的生成 token 累计（按任务差分累加）
-
 # 快慢双采样共享的"当前快照"：快循环(llama 2s)每拍刷新 ts 并 append 历史，
 # 慢循环(GPU/系统 10s)整块替换 gpu / ram / cpu 等键，浅拷贝安全
 _snap_lock = threading.Lock()
@@ -117,18 +110,29 @@ def _n(v):
         return None
 
 
-def sample_gpu():
-    """nvidia-smi，支持多卡。返回 {"gpus": [...], "error": None|msg}"""
-    # pythonw（.pyw）下父进程没有控制台，nvidia-smi 每次都会闪出黑色窗口；
-    # 加 CREATE_NO_WINDOW 让子进程不创建新控制台。
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        out = subprocess.run(
-            ["nvidia-smi",
-             "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,fan.speed",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=flags).stdout
+# ---------------- 采样器 adapter ----------------
+# GPU 采样和 LLM 采样各收拢成一个类，主循环只调 sample() 接口。
+# 以后要支持 AMD/Intel GPU 或 Ollama/vLLM，加新 adapter 类并在
+# _make_gpu_sampler() / _make_llm_sampler() 里挑一个即可，主逻辑不动。
+
+class NvidiaGpuSampler:
+    """nvidia-smi 采样（NVIDIA 专用），支持多卡。
+    sample() → {"gpus": [...], "error": None|msg}"""
+
+    QUERY = ["nvidia-smi",
+             "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,"
+             "temperature.gpu,power.draw,fan.speed",
+             "--format=csv,noheader,nounits"]
+
+    def sample(self):
+        # pythonw（.pyw）下父进程没有控制台，nvidia-smi 每次都会闪出黑色窗口；
+        # 加 CREATE_NO_WINDOW 让子进程不创建新控制台。
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            out = subprocess.run(self.QUERY, capture_output=True, text=True, timeout=5,
+                                 creationflags=flags).stdout
+        except Exception as e:
+            return {"gpus": [], "error": str(e)}
         gpus = []
         for line in out.strip().splitlines():
             line = line.strip()
@@ -150,8 +154,11 @@ def sample_gpu():
         if not gpus:
             return {"gpus": [], "error": "no output"}
         return {"gpus": gpus, "error": None}
-    except Exception as e:
-        return {"gpus": [], "error": str(e)}
+
+
+def _make_gpu_sampler():
+    """按平台/驱动挑 GPU adapter（AMD/Intel 以后在这里加分支）"""
+    return NvidiaGpuSampler()
 
 
 def sample_system():
@@ -189,152 +196,167 @@ def sample_system():
     }
 
 
-def _llm_get(path, timeout=3):
-    with urllib.request.urlopen(LLM_URL.rstrip("/") + path, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+class LlamaCppSampler:
+    """llama.cpp server 采样：/slots 差分算速度，/metrics 拉 Prometheus 计数器。
+    （Ollama / vLLM 的 adapter 以后加在这里）"""
 
+    def __init__(self, base_url):
+        self.base_url = base_url.rstrip("/")
+        # _prev[sid]  = 上一次采样的 (n_decoded, n_prompt_processed, task_id, t)
+        # _track[sid] = 当前任务 {task, t0, d0, samples:[(t, n_decoded)...]}
+        self._prev = {}
+        self._track = {}
+        self.sess_decoded = 0  # 面板启动以来观察到的生成 token 累计（按任务差分累加）
 
-def _metrics_get():
-    """拉取 llama-server Prometheus 文本指标，返回 {name: float}"""
-    with urllib.request.urlopen(LLM_URL.rstrip("/") + "/metrics", timeout=3) as r:
-        text = r.read().decode("utf-8", "replace")
-    out = {}
-    for line in text.splitlines():
-        if not line.startswith("llamacpp:"):
-            continue
-        name, _, val = line.rpartition(" ")
+    def _get(self, path, timeout=3):
+        with urllib.request.urlopen(self.base_url + path, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def metrics(self):
+        """拉取 llama-server Prometheus 文本指标，返回 {name: float}"""
+        with urllib.request.urlopen(self.base_url + "/metrics", timeout=3) as r:
+            text = r.read().decode("utf-8", "replace")
+        out = {}
+        for line in text.splitlines():
+            if not line.startswith("llamacpp:"):
+                continue
+            name, _, val = line.rpartition(" ")
+            try:
+                out[name] = float(val)
+            except ValueError:
+                pass
+        return out
+
+    def sample(self):
+        """查询 /slots，差分计算每个 slot 的 3s 窗口速度 / 任务平均速度 / prompt 速度"""
+        base = {"url": self.base_url, "online": False, "error": None,
+                "slots": [], "busy": 0, "total": 0}
         try:
-            out[name] = float(val)
-        except ValueError:
-            pass
-    return out
+            slots_raw = self._get("/slots")
+            if not isinstance(slots_raw, list):
+                raise ValueError("bad /slots response")
+        except Exception as e:
+            base["error"] = str(e)
+            return base
 
+        now = time.time()
+        slots = []
+        busy = 0
+        for raw in slots_raw:
+            if not isinstance(raw, dict):
+                continue
+            sid = raw.get("id")
+            task = raw.get("id_task")
+            ctx = raw.get("n_ctx", 0) or 0
+            n_prompt = raw.get("n_prompt_tokens", 0) or 0
+            n_prompt_proc = raw.get("n_prompt_tokens_processed", 0) or 0
+            nt = (raw.get("next_token") or [{}])[0]
+            if not isinstance(nt, dict):
+                nt = {}
+            n_decoded = nt.get("n_decoded", 0) or 0
+            n_remain = nt.get("n_remain")
+            processing = bool(raw.get("is_processing"))
+            if processing:
+                busy += 1
 
-def sample_llama():
-    """查询 llama-server /slots，差分计算每个 slot 的 3s 窗口速度 / 任务平均速度 / prompt 速度"""
-    base = {"url": LLM_URL, "online": False, "error": None, "slots": [], "busy": 0, "total": 0}
-    try:
-        slots_raw = _llm_get("/slots")
-        if not isinstance(slots_raw, list):
-            raise ValueError("bad /slots response")
-    except Exception as e:
-        base["error"] = str(e)
-        return base
+            # --- 记录上次采样 + 观察生成 token 累计 ---
+            prev = self._prev.get(sid)
+            if prev and task == prev.get("task"):
+                d_dec = n_decoded - prev.get("n_decoded", 0)
+                if d_dec > 0:
+                    self.sess_decoded += d_dec
+            self._prev[sid] = {"t": now, "n_decoded": n_decoded,
+                               "n_prompt_processed": n_prompt_proc, "task": task}
 
-    now = time.time()
-    slots = []
-    busy = 0
-    for raw in slots_raw:
-        if not isinstance(raw, dict):
-            continue
-        sid = raw.get("id")
-        task = raw.get("id_task")
-        ctx = raw.get("n_ctx", 0) or 0
-        n_prompt = raw.get("n_prompt_tokens", 0) or 0
-        n_prompt_proc = raw.get("n_prompt_tokens_processed", 0) or 0
-        nt = (raw.get("next_token") or [{}])[0]
-        if not isinstance(nt, dict):
-            nt = {}
-        n_decoded = nt.get("n_decoded", 0) or 0
-        n_remain = nt.get("n_remain")
-        processing = bool(raw.get("is_processing"))
-        if processing:
-            busy += 1
+            # --- 任务追踪：任务切换（task id 变化）时重置 ---
+            tr = self._track.get(sid)
+            if tr is None or tr.get("task") != task:
+                tr = {"task": task, "t0": now, "d0": n_decoded, "p0": n_prompt_proc,
+                      "samples": deque(maxlen=64), "psamples": deque(maxlen=64)}
+                self._track[sid] = tr
+            tr["samples"].append((now, n_decoded))
+            tr["psamples"].append((now, n_prompt_proc))
+            cutoff = now - RECENT_KEEP_S
+            while tr["samples"] and tr["samples"][0][0] < cutoff:
+                tr["samples"].popleft()
+            while tr["psamples"] and tr["psamples"][0][0] < cutoff:
+                tr["psamples"].popleft()
+            task_elapsed = round(now - tr["t0"], 1) if processing else None
 
-        # --- 记录上次采样 + 观察生成 token 累计 ---
-        prev = _llama_prev.get(sid)
-        if prev and task == prev.get("task"):
-            d_dec = n_decoded - prev.get("n_decoded", 0)
-            if d_dec > 0:
-                _sess_decoded[0] += d_dec
-        _llama_prev[sid] = {"t": now, "n_decoded": n_decoded,
-                            "n_prompt_processed": n_prompt_proc, "task": task}
-
-        # --- 任务追踪：任务切换（task id 变化）时重置 ---
-        tr = _llama_track.get(sid)
-        if tr is None or tr.get("task") != task:
-            tr = {"task": task, "t0": now, "d0": n_decoded, "p0": n_prompt_proc,
-                  "samples": deque(maxlen=64), "psamples": deque(maxlen=64)}
-            _llama_track[sid] = tr
-        tr["samples"].append((now, n_decoded))
-        tr["psamples"].append((now, n_prompt_proc))
-        cutoff = now - RECENT_KEEP_S
-        while tr["samples"] and tr["samples"][0][0] < cutoff:
-            tr["samples"].popleft()
-        while tr["psamples"] and tr["psamples"][0][0] < cutoff:
-            tr["psamples"].popleft()
-        task_elapsed = round(now - tr["t0"], 1) if processing else None
-
-        # --- Prompt (prefill) 速度：10s 滑动窗口 ---
-        # n_prompt_tokens_processed 按 batch 跳变（chunked prefill），相邻差分
-        # 会在 0 和 batch 速率之间横跳；10s 窗口跨多个 batch，毛刺被抹平
-        prompt_tps = None
-        target = now - RECENT_KEEP_S
-        ref_t, ref_p = tr["t0"], tr["p0"]
-        for (st, sp) in tr["psamples"]:
-            if st <= target:
-                ref_t, ref_p = st, sp
-            else:
-                break
-        d_pp = n_prompt_proc - ref_p
-        if d_pp > 0:
-            prompt_tps = round(d_pp / max(now - ref_t, 1e-6), 1)
-
-        gen_recent = gen_avg = None
-        if processing and n_decoded > 0:
-            # 任务平均速度：从任务开始累计
-            dt_avg = max(now - tr["t0"], 1e-6)
-            d_avg = n_decoded - tr["d0"]
-            if d_avg > 0:
-                gen_avg = round(d_avg / dt_avg, 1)
-            # 3s 窗口速度：找最接近 now-3s 的样本做基准
-            target = now - RECENT_WINDOW_S
-            ref_t, ref_d = tr["t0"], tr["d0"]
-            for (st, sd) in tr["samples"]:
+            # --- Prompt (prefill) 速度：10s 滑动窗口 ---
+            # n_prompt_tokens_processed 按 batch 跳变（chunked prefill），相邻差分
+            # 会在 0 和 batch 速率之间横跳；10s 窗口跨多个 batch，毛刺被抹平
+            prompt_tps = None
+            target = now - RECENT_KEEP_S
+            ref_t, ref_p = tr["t0"], tr["p0"]
+            for (st, sp) in tr["psamples"]:
                 if st <= target:
-                    ref_t, ref_d = st, sd
+                    ref_t, ref_p = st, sp
                 else:
                     break
-            dt_r = max(now - ref_t, 1e-6)
-            d_r = n_decoded - ref_d
-            if d_r > 0:
-                gen_recent = round(d_r / dt_r, 1)
+            d_pp = n_prompt_proc - ref_p
+            if d_pp > 0:
+                prompt_tps = round(d_pp / max(now - ref_t, 1e-6), 1)
 
-        remain_est = None
-        if processing and n_remain and n_remain > 0:
-            sp = gen_recent if gen_recent else gen_avg
-            if sp:
-                remain_est = round(n_remain / sp, 1)
+            gen_recent = gen_avg = None
+            if processing and n_decoded > 0:
+                # 任务平均速度：从任务开始累计
+                dt_avg = max(now - tr["t0"], 1e-6)
+                d_avg = n_decoded - tr["d0"]
+                if d_avg > 0:
+                    gen_avg = round(d_avg / dt_avg, 1)
+                # 3s 窗口速度：找最接近 now-3s 的样本做基准
+                target = now - RECENT_WINDOW_S
+                ref_t, ref_d = tr["t0"], tr["d0"]
+                for (st, sd) in tr["samples"]:
+                    if st <= target:
+                        ref_t, ref_d = st, sd
+                    else:
+                        break
+                dt_r = max(now - ref_t, 1e-6)
+                d_r = n_decoded - ref_d
+                if d_r > 0:
+                    gen_recent = round(d_r / dt_r, 1)
 
-        slots.append({
-            "id": sid,
-            "processing": processing,
-            "task": task,
-            "ctx": ctx,
-            "ctx_used": n_prompt,
-            "ctx_pct": round(n_prompt / ctx * 100, 1) if ctx else 0,
-            "n_decoded": n_decoded,
-            "gen_recent_tps": gen_recent,
-            "gen_avg_tps": gen_avg,
-            "prompt_tps": prompt_tps,
-            "task_elapsed": task_elapsed,
-            "remain_est": remain_est,
-            "has_next": nt.get("has_next_token"),
-            "n_remain": n_remain,
-            "speculative": raw.get("speculative"),
-        })
+            remain_est = None
+            if processing and n_remain and n_remain > 0:
+                sp = gen_recent if gen_recent else gen_avg
+                if sp:
+                    remain_est = round(n_remain / sp, 1)
 
-    tot_recent = round(sum(sl["gen_recent_tps"] or 0 for sl in slots), 1)
-    tot_avg = round(sum(sl["gen_avg_tps"] or 0 for sl in slots), 1)
-    tot_prompt = round(sum(sl["prompt_tps"] or 0 for sl in slots), 1)
-    if busy > 0:
-        _busy_s[0] += SAMPLE_INTERVAL  # 本拍有 slot 在生成 → 计入推理忙碌时长
-    base.update({"online": True, "slots": slots, "busy": busy, "total": len(slots),
-                 "tot_recent_tps": tot_recent,
-                 "tot_avg_tps": tot_avg,
-                 "tot_prompt_tps": tot_prompt,
-                 "sess_decoded": _sess_decoded[0]})
-    return base
+            slots.append({
+                "id": sid,
+                "processing": processing,
+                "task": task,
+                "ctx": ctx,
+                "ctx_used": n_prompt,
+                "ctx_pct": round(n_prompt / ctx * 100, 1) if ctx else 0,
+                "n_decoded": n_decoded,
+                "gen_recent_tps": gen_recent,
+                "gen_avg_tps": gen_avg,
+                "prompt_tps": prompt_tps,
+                "task_elapsed": task_elapsed,
+                "remain_est": remain_est,
+                "has_next": nt.get("has_next_token"),
+                "n_remain": n_remain,
+                "speculative": raw.get("speculative"),
+            })
+
+        base.update({"online": True, "slots": slots, "busy": busy, "total": len(slots),
+                     "tot_recent_tps": round(sum(sl["gen_recent_tps"] or 0 for sl in slots), 1),
+                     "tot_avg_tps": round(sum(sl["gen_avg_tps"] or 0 for sl in slots), 1),
+                     "tot_prompt_tps": round(sum(sl["prompt_tps"] or 0 for sl in slots), 1),
+                     "sess_decoded": self.sess_decoded})
+        return base
+
+
+def _make_llm_sampler():
+    """挑 LLM 后端 adapter（Ollama/vLLM 以后在这里加分支）"""
+    return LlamaCppSampler(LLM_URL)
+
+
+GPU_SAMPLER = _make_gpu_sampler()
+LLM_SAMPLER = _make_llm_sampler()
 
 
 def _write_csv(s):
@@ -377,7 +399,9 @@ def sampler_loop_fast():
     """快循环（默认 2s）：只采 llama.cpp /slots，刷新时间戳并 append 历史/CSV"""
     while True:
         try:
-            llama = sample_llama()
+            llama = LLM_SAMPLER.sample()
+            if llama.get("busy"):
+                _busy_s[0] += SAMPLE_INTERVAL  # 本拍有 slot 在生成 → 计入推理忙碌时长
             now = time.time()
             with _snap_lock:
                 _current["llama"] = llama
@@ -402,7 +426,7 @@ def sampler_loop_slow():
     psutil.cpu_percent(interval=None)  # 初始化基线
     while True:
         try:
-            gpu = sample_gpu()
+            gpu = GPU_SAMPLER.sample()
             sysd = sample_system()
             with _snap_lock:
                 _current["gpu"] = gpu
@@ -436,7 +460,7 @@ def _stats_record():
         "temp": gpus[0].get("temp") if gpus else None,
     }
     try:
-        m = _metrics_get()
+        m = LLM_SAMPLER.metrics()
         row["gt"] = m.get("llamacpp:tokens_predicted_total")
         row["pt"] = m.get("llamacpp:prompt_tokens_total")
         row["ps"] = round(m.get("llamacpp:tokens_predicted_seconds_total") or 0, 3)
